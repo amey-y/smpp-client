@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMPP Client</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M8 10h16v10H14l-5 4v-4H8z' fill='white'/></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side">
+    <div class="brand"><svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--accent)"/><path d="M8 10h16v10H14l-5 4v-4H8z" fill="#fff"/></svg> SMPP Client <small>load tester</small></div>
+    <button data-view="dashboard" class="active">Dashboard</button>
+    <button data-view="connections">Connections <span class="pill" id="nav-binds">0/0</span></button>
+    <button data-view="send">Send SMS</button>
+    <button data-view="jobs">Jobs <span class="pill" id="nav-jobs">0</span></button>
+    <button data-view="inbound">DLR / MO</button>
+    <div class="sep"></div>
+    <button data-view="trace">PDU Trace</button>
+    <button data-view="logs">Event Log</button>
+    <button data-view="history">History</button>
+    <button data-view="mock">Mock SMSC</button>
+    <div class="sep"></div>
+    <div class="foot">
+      <div><span class="dot" id="ws-dot"></span> <span id="ws-text">connecting…</span></div>
+      <div style="margin-top:8px"><button class="btn sm" id="theme-btn">Toggle theme</button></div>
+    </div>
+  </nav>
+
+  <main>
+    <!-- ================================================================ DASHBOARD -->
+    <section class="view active" id="v-dashboard">
+      <header class="top"><h1>Dashboard</h1>
+        <select id="dash-conn" style="width:auto"></select>
+      </header>
+      <div class="tiles" id="dash-tiles"></div>
+      <div class="panel">
+        <h2>Throughput (per second, last 5 min) <span class="grow"></span>
+          <span class="legend"><span><i style="background:var(--s1)"></i>submit_sm</span><span><i style="background:var(--s2)"></i>submit_sm_resp</span><span><i style="background:var(--s3)"></i>DLR</span><span><i style="background:var(--s4)"></i>MO</span></span></h2>
+        <canvas class="chart" id="dash-chart"></canvas>
+      </div>
+      <div class="grid g2">
+        <div class="panel"><h2>Active jobs</h2><div id="dash-jobs"></div></div>
+        <div class="panel"><h2>Recent events</h2><div class="log" id="dash-log" style="max-height:300px"></div></div>
+      </div>
+    </section>
+
+    <!-- ================================================================ CONNECTIONS -->
+    <section class="view" id="v-connections">
+      <header class="top"><h1>Connections</h1>
+        <button class="btn primary" id="conn-new">+ New connection</button>
+      </header>
+      <div id="conn-list"></div>
+    </section>
+
+    <!-- ================================================================ SEND -->
+    <section class="view" id="v-send">
+      <header class="top"><h1>Send SMS</h1>
+        <select id="tpl-select" style="width:auto"><option value="">Load saved template…</option></select>
+        <button class="btn" id="tpl-save">Save as template</button>
+        <button class="btn danger" id="tpl-del" title="Delete selected template">Delete template</button>
+      </header>
+      <div class="grid g2">
+        <div>
+          <div class="panel">
+            <h2>Recipients</h2>
+            <div class="tabs" id="send-tabs">
+              <button data-src="single" class="active">Single</button>
+              <button data-src="list">Bulk list</button>
+              <button data-src="generate">Generate numbers</button>
+              <button data-src="csv">CSV upload</button>
+            </div>
+            <div data-pane="single">
+              <label class="f"><span>Destination number</span><input id="s-single" placeholder="e.g. 919876543210" autocomplete="off"></label>
+              <div class="hint" style="margin-top:6px">Leading + / 00, spaces and dashes are stripped.</div>
+            </div>
+            <div data-pane="list" hidden>
+              <label class="f"><span>Destination numbers — one per line (commas/semicolons also accepted)</span>
+                <textarea id="s-list" rows="9" placeholder="919876543210&#10;919876543211"></textarea></label>
+              <div class="row" style="margin-top:6px">
+                <label class="c"><input type="checkbox" id="s-dedupe" checked> Remove duplicates</label>
+                <span class="hint" id="s-list-count"></span>
+              </div>
+            </div>
+            <div data-pane="generate" hidden>
+              <div class="form">
+                <label class="f"><span>How many numbers</span><input id="g-count" type="number" min="1" value="100"></label>
+                <label class="f"><span>Country code</span><input id="g-cc" value="91" placeholder="91"></label>
+                <label class="f"><span>Number length (without country code)</span><input id="g-len" type="number" min="3" max="15" value="10"></label>
+                <label class="f"><span>Prefixes (comma separated, optional)</span><input id="g-prefix" value="98,97,96,70,80,90" placeholder="98,97"></label>
+                <label class="f"><span>Mode</span><select id="g-mode"><option value="random">Random</option><option value="sequential">Sequential</option></select></label>
+                <label class="f"><span>Sequential start offset</span><input id="g-start" type="number" min="0" value="0"></label>
+                <label class="c wide"><input type="checkbox" id="g-unique" checked> Unique numbers only</label>
+              </div>
+              <div class="hint" style="margin-top:8px">Sample: <span class="mono" id="g-sample"></span></div>
+            </div>
+            <div data-pane="csv" hidden>
+              <div class="row">
+                <input type="file" id="csv-file" accept=".csv,.txt,text/csv,text/plain" style="flex:1">
+                <button class="btn" id="csv-upload">Upload</button>
+              </div>
+              <div class="hint" style="margin-top:6px">One number per line, or columns (e.g. <span class="mono">number,message</span>). Header lines and invalid rows are skipped.</div>
+              <div id="csv-info"></div>
+              <div class="form" style="margin-top:10px">
+                <label class="f"><span>Number column #</span><input id="csv-numcol" type="number" min="1" value="1"></label>
+                <label class="f"><span>Message column # (optional, overrides text)</span><input id="csv-msgcol" type="number" min="0" value="0"></label>
+                <label class="c"><input type="checkbox" id="csv-dedupe"> Remove duplicates</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h2>Message</h2>
+            <div class="form">
+              <label class="f"><span>Connection</span><select id="s-conn"></select></label>
+              <label class="f"><span>Sender ID (source_addr)</span><input id="s-src" value="ONEXTL" maxlength="20"></label>
+              <label class="f wide"><span>Text <span class="grow"></span></span>
+                <textarea id="s-text" rows="5" placeholder="Your message. Placeholders: {number} {seq} {otp} {rand:4} {uuid:8} {time} {date} {job}">Dear customer, your OTP is {otp}. Do not share it with anyone.</textarea></label>
+            </div>
+            <div class="counter" id="s-counter"></div>
+            <div class="chips" style="margin-top:8px" id="s-placeholders"></div>
+            <div class="form" style="margin-top:12px">
+              <label class="f"><span>Encoding / data_coding</span><select id="s-enc">
+                <option value="auto">Auto (GSM7 or UCS2)</option><option value="gsm7">GSM 03.38 7-bit (DC 0, unpacked)</option>
+                <option value="gsm7_packed">GSM 7-bit packed (DC 0)</option><option value="ascii">IA5 / ASCII (DC 1)</option>
+                <option value="latin1">Latin-1 (DC 3)</option><option value="ucs2">UCS2 / Unicode (DC 8)</option>
+                <option value="binary">Binary – text is hex (DC 4)</option></select></label>
+              <label class="f"><span>Long message mode</span><select id="s-long">
+                <option value="udh">Concatenate – UDH (esm_class 0x40)</option><option value="sar">Concatenate – SAR TLVs</option>
+                <option value="payload">Single PDU – message_payload TLV</option><option value="truncate">Truncate to 1 segment</option></select></label>
+              <label class="f"><span>Delivery receipt</span><select id="s-dlr">
+                <option value="1">Request DLR (success + failure)</option><option value="2">Failure only</option>
+                <option value="17">Final + intermediate</option><option value="0">No DLR</option></select></label>
+            </div>
+            <details class="adv">
+              <summary>DLT / TLV parameters</summary>
+              <div class="form">
+                <label class="f"><span>Entity / PE ID (0x1400)</span><input id="s-dlt-pe" placeholder="1201159xxxxxxxxxx"></label>
+                <label class="f"><span>Template ID (0x1401)</span><input id="s-dlt-tpl" placeholder="1207161xxxxxxxxxx"></label>
+                <label class="f"><span>TM ID (0x1402)</span><input id="s-dlt-tm"></label>
+                <label class="c"><input type="checkbox" id="s-dlt-nul"> NUL-terminate DLT values</label>
+              </div>
+              <h3>Custom TLVs</h3>
+              <div id="tlv-rows"></div>
+              <button class="btn sm" id="tlv-add">+ Add TLV</button>
+            </details>
+            <details class="adv">
+              <summary>Advanced submit_sm fields</summary>
+              <div class="form">
+                <label class="f"><span>Source TON</span><select id="s-ston"></select></label>
+                <label class="f"><span>Source NPI</span><select id="s-snpi"></select></label>
+                <label class="f"><span>Dest TON</span><select id="s-dton"></select></label>
+                <label class="f"><span>Dest NPI</span><select id="s-dnpi"></select></label>
+                <label class="f"><span>service_type</span><input id="s-svc" maxlength="5"></label>
+                <label class="f"><span>esm_class (extra bits)</span><input id="s-esm" type="number" min="0" max="255" value="0"></label>
+                <label class="f"><span>protocol_id</span><input id="s-pid" type="number" min="0" max="255" value="0"></label>
+                <label class="f"><span>priority_flag</span><input id="s-prio" type="number" min="0" max="3" value="0"></label>
+                <label class="f"><span>data_coding override</span><input id="s-dc" type="number" min="0" max="255" placeholder="(from encoding)"></label>
+                <label class="f"><span>validity_period</span><input id="s-valid" placeholder="000001000000000R"></label>
+                <label class="f"><span>schedule_delivery_time</span><input id="s-sched" placeholder="YYMMDDhhmmsstnnp"></label>
+              </div>
+            </details>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel">
+            <h2>Throughput &amp; load</h2>
+            <div class="form">
+              <label class="f"><span>TPS (submit_sm PDUs / sec, 0 = unlimited)</span><input id="s-tps" type="number" min="0" step="any" value="100"></label>
+              <label class="f"><span>Ramp-up (seconds)</span><input id="s-ramp" type="number" min="0" value="0"></label>
+              <label class="f"><span>Repeat recipient list ×</span><input id="s-repeat" type="number" min="1" value="1"></label>
+              <label class="f"><span>Run for duration (sec, 0 = off)</span><input id="s-duration" type="number" min="0" value="0"></label>
+              <label class="f"><span>Max messages (0 = all)</span><input id="s-max" type="number" min="0" value="0"></label>
+              <label class="f"><span>Retries on throttle / queue-full</span><input id="s-retries" type="number" min="0" value="3"></label>
+              <label class="f wide"><span>Job name (optional)</span><input id="s-name" placeholder="e.g. 10-bind 500 TPS soak"></label>
+            </div>
+            <div class="hint" style="margin-top:8px">TPS is shared across all bound TX/TRX binds of the connection (round-robin, each limited by its window). A long message counts as one PDU per segment.</div>
+            <div class="result" id="s-summary"></div>
+            <div class="row" style="margin-top:14px">
+              <button class="btn primary" id="s-send" style="padding:10px 22px;font-size:15px">Send</button>
+              <span class="hint" id="s-send-hint"></span>
+            </div>
+            <div id="s-single-result"></div>
+          </div>
+          <div class="panel">
+            <h2>Connection status</h2>
+            <div id="s-conn-status"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================================ JOBS -->
+    <section class="view" id="v-jobs">
+      <header class="top"><h1>Jobs</h1></header>
+      <div class="panel"><div class="tablewrap"><table id="jobs-table"></table></div></div>
+      <div id="job-detail"></div>
+    </section>
+
+    <!-- ================================================================ INBOUND -->
+    <section class="view" id="v-inbound">
+      <header class="top"><h1>Delivery receipts &amp; MO</h1>
+        <select id="in-kind" style="width:auto"><option value="">All</option><option value="DLR">DLR</option><option value="MO">MO</option></select>
+        <input id="in-search" placeholder="Filter (number, id, status, text)" style="width:260px">
+        <button class="btn" id="in-clear">Clear</button>
+      </header>
+      <div class="tiles" id="in-tiles"></div>
+      <div class="panel"><div class="tablewrap scroll" style="max-height:640px"><table id="in-table"></table></div></div>
+    </section>
+
+    <!-- ================================================================ TRACE -->
+    <section class="view" id="v-trace">
+      <header class="top"><h1>PDU Trace</h1>
+        <input id="tr-filter" placeholder="Filter (command, seq, status)" style="width:240px">
+        <label class="c"><input type="checkbox" id="tr-hide-el"> Hide enquire_link</label>
+        <label class="c"><input type="checkbox" id="tr-pause"> Pause</label>
+        <button class="btn" id="tr-clear">Clear</button>
+      </header>
+      <div class="panel">
+        <div class="hint" style="margin-bottom:8px">Enable tracing per connection on the Connections page. Tracing every PDU costs CPU at high TPS — use it for debugging, not full-speed load tests.</div>
+        <div id="tr-conns" class="row" style="margin-bottom:10px"></div>
+        <div class="tablewrap scroll" style="max-height:640px"><table id="tr-table"></table></div>
+      </div>
+    </section>
+
+    <!-- ================================================================ LOGS -->
+    <section class="view" id="v-logs">
+      <header class="top"><h1>Event log</h1>
+        <select id="log-level" style="width:auto"><option value="">All levels</option><option value="warn">Warnings+</option><option value="error">Errors</option></select>
+      </header>
+      <div class="panel"><div class="log" id="log-box" style="max-height:72vh"></div></div>
+    </section>
+
+    <!-- ================================================================ HISTORY -->
+    <section class="view" id="v-history">
+      <header class="top"><h1>Job history</h1><button class="btn" id="hist-refresh">Refresh</button></header>
+      <div class="panel"><div class="tablewrap"><table id="hist-table"></table></div></div>
+    </section>
+
+    <!-- ================================================================ MOCK -->
+    <section class="view" id="v-mock">
+      <header class="top"><h1>Mock SMSC (built-in simulator)</h1><span id="mock-state"></span></header>
+      <div class="grid g2">
+        <div class="panel">
+          <h2>Settings</h2>
+          <div class="form">
+            <label class="f"><span>Listen port</span><input id="m-port" type="number" value="2775"></label>
+            <label class="f"><span>Max binds per system_id</span><input id="m-max_binds" type="number" value="10"></label>
+            <label class="f"><span>system_id (blank = any)</span><input id="m-system_id"></label>
+            <label class="f"><span>password (blank = any)</span><input id="m-password"></label>
+            <label class="f"><span>TPS limit per bind (0 = off)</span><input id="m-tps_per_bind" type="number" value="0"></label>
+            <label class="f"><span>Reject rate (0–1)</span><input id="m-reject_rate" type="number" step="0.01" value="0"></label>
+            <label class="f"><span>submit_sm_resp delay (ms)</span><input id="m-resp_delay_ms" type="number" value="0"></label>
+            <label class="f"><span>DLR delay (ms, ±50%)</span><input id="m-dlr_delay_ms" type="number" value="1000"></label>
+            <label class="f"><span>UNDELIV rate (0–1)</span><input id="m-dlr_undeliv_rate" type="number" step="0.01" value="0.05"></label>
+            <label class="c"><input type="checkbox" id="m-send_dlr" checked> Send DLRs (TRX binds)</label>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn primary" id="mock-start">Start / restart</button>
+            <button class="btn" id="mock-stop">Stop</button>
+            <button class="btn" id="mock-profile">Create connection profile for mock</button>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Status</h2>
+          <div id="mock-status"></div>
+          <p class="hint">Use the simulator to verify client behaviour (bind limits, throttling errors, retries, DLR matching) without touching a production SMSC. Also runnable standalone: <span class="mono">./run.sh mock --port 2775</span></p>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- connection editor -->
+<dialog id="conn-dialog">
+  <form method="dialog" id="conn-form">
+    <div class="dh"><span id="conn-dialog-title">Connection</span></div>
+    <div class="db">
+      <div class="form">
+        <label class="f"><span>Profile name</span><input name="name" required></label>
+        <label class="f"><span>Host</span><input name="host" required></label>
+        <label class="f"><span>Port</span><input name="port" type="number" required></label>
+        <label class="f"><span>system_id</span><input name="system_id" maxlength="15" autocomplete="off"></label>
+        <label class="f"><span>password</span><input name="password" type="password" maxlength="8" autocomplete="new-password" placeholder=""></label>
+        <label class="f"><span>system_type</span><input name="system_type" maxlength="12"></label>
+        <label class="f"><span>Bind type</span><select name="bind_type"><option value="TRX">Transceiver (TRX)</option><option value="TX">Transmitter (TX)</option><option value="RX">Receiver (RX)</option></select></label>
+        <label class="f"><span>Number of binds</span><input name="binds" type="number" min="0" max="100"></label>
+        <label class="f"><span>Extra RX binds (for DLRs)</span><input name="rx_binds" type="number" min="0" max="100"></label>
+        <label class="f"><span>Window (max unacked per bind)</span><input name="window" type="number" min="1" max="10000"></label>
+        <label class="f"><span>enquire_link interval (s)</span><input name="enquire_interval" type="number" min="1"></label>
+        <label class="f"><span>Response timeout (s)</span><input name="response_timeout" type="number" min="1"></label>
+        <label class="f"><span>Bind timeout (s)</span><input name="bind_timeout" type="number" min="1"></label>
+        <label class="f"><span>Delay between binds (ms)</span><input name="bind_stagger_ms" type="number" min="0"></label>
+        <label class="f"><span>interface_version</span><select name="interface_version"><option value="52">3.4 (0x34)</option><option value="51">3.3 (0x33)</option><option value="80">5.0 (0x50)</option></select></label>
+        <label class="f"><span>addr_ton</span><input name="addr_ton" type="number" min="0" max="6"></label>
+        <label class="f"><span>addr_npi</span><input name="addr_npi" type="number" min="0" max="18"></label>
+        <label class="f"><span>address_range</span><input name="address_range"></label>
+        <label class="c"><input type="checkbox" name="reconnect"> Auto-reconnect</label>
+        <label class="c"><input type="checkbox" name="tls"> TLS</label>
+        <label class="c"><input type="checkbox" name="tls_verify"> Verify TLS cert</label>
+      </div>
+      <p class="hint" id="conn-pass-hint"></p>
+    </div>
+    <div class="df">
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn" value="save">Save</button>
+      <button class="btn primary" value="savebind">Save &amp; bind</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
