@@ -17,6 +17,8 @@ BIND_TRANSCEIVER = 0x00000009
 BIND_TRANSCEIVER_RESP = 0x80000009
 ENQUIRE_LINK = 0x00000015
 ENQUIRE_LINK_RESP = 0x80000015
+OUTBIND = 0x0000000B
+ALERT_NOTIFICATION = 0x00000102
 DATA_SM = 0x00000103
 DATA_SM_RESP = 0x80000103
 
@@ -30,6 +32,7 @@ COMMAND_NAMES = {
     BIND_TRANSCEIVER: "bind_transceiver", BIND_TRANSCEIVER_RESP: "bind_transceiver_resp",
     ENQUIRE_LINK: "enquire_link", ENQUIRE_LINK_RESP: "enquire_link_resp",
     DATA_SM: "data_sm", DATA_SM_RESP: "data_sm_resp",
+    OUTBIND: "outbind", ALERT_NOTIFICATION: "alert_notification",
 }
 
 BIND_COMMANDS = {"TRX": BIND_TRANSCEIVER, "TX": BIND_TRANSMITTER, "RX": BIND_RECEIVER}
@@ -64,12 +67,13 @@ TLV_MESSAGE_PAYLOAD = 0x0424
 TLV_RECEIPTED_MESSAGE_ID = 0x001E
 TLV_MESSAGE_STATE = 0x0427
 TLV_NETWORK_ERROR_CODE = 0x0423
+TLV_SC_INTERFACE_VERSION = 0x0210
 
 MESSAGE_STATES = {1: "ENROUTE", 2: "DELIVRD", 3: "EXPIRED", 4: "DELETED", 5: "UNDELIV",
                   6: "ACCEPTD", 7: "UNKNOWN", 8: "REJECTD"}
 
 
-class PDUError(Exception):
+class PDUError(ValueError):
     pass
 
 
@@ -96,27 +100,45 @@ def encode_tlvs(tlvs):
 
 def bind(command_id, seq, system_id, password, system_type="", interface_version=0x34,
          addr_ton=0, addr_npi=0, address_range=""):
-    body = (cstr(system_id, 16) + cstr(password, 9) + cstr(system_type, 13) +
+    # system_id / password are not truncated: SMPP 3.4 caps them at 15 / 8 chars, but many
+    # servers issue longer credentials, and a silently truncated password is hard to debug.
+    body = (cstr(system_id) + cstr(password) + cstr(system_type, 13) +
             struct.pack(">BBB", interface_version, addr_ton, addr_npi) + cstr(address_range, 41))
     return header(command_id, 0, seq, body)
 
 
-def submit_sm(seq, *, service_type="", source_addr_ton=0, source_addr_npi=0, source_addr="",
-              dest_addr_ton=1, dest_addr_npi=1, destination_addr="", esm_class=0, protocol_id=0,
-              priority_flag=0, schedule_delivery_time="", validity_period="",
-              registered_delivery=0, replace_if_present_flag=0, data_coding=0,
-              sm_default_msg_id=0, short_message=b"", tlvs=()):
-    if len(short_message) > 254:
-        raise PDUError("short_message longer than 254 octets; use message_payload")
-    body = (cstr(service_type, 6) +
-            struct.pack(">BB", source_addr_ton, source_addr_npi) + cstr(source_addr, 21) +
-            struct.pack(">BB", dest_addr_ton, dest_addr_npi) + cstr(destination_addr, 21) +
-            struct.pack(">BBB", esm_class, protocol_id, priority_flag) +
-            cstr(schedule_delivery_time, 17) + cstr(validity_period, 17) +
-            struct.pack(">BBBBB", registered_delivery, replace_if_present_flag, data_coding,
-                        sm_default_msg_id, len(short_message)) +
-            short_message + encode_tlvs(tlvs))
-    return header(SUBMIT_SM, 0, seq, body)
+class SubmitTemplate:
+    """Pre-encodes the submit_sm fields that are identical for every message of a job, so only
+    destination, esm_class, data_coding, short_message and per-part TLVs are encoded per PDU."""
+    __slots__ = ("head", "esm_class", "mid", "tail", "sm_default_msg_id", "tlvs")
+
+    def __init__(self, *, service_type="", source_addr_ton=0, source_addr_npi=0, source_addr="",
+                 dest_addr_ton=1, dest_addr_npi=1, esm_class=0, protocol_id=0, priority_flag=0,
+                 schedule_delivery_time="", validity_period="", registered_delivery=0,
+                 replace_if_present_flag=0, sm_default_msg_id=0, tlvs=()):
+        self.head = (cstr(service_type, 6) + struct.pack(">BB", source_addr_ton, source_addr_npi) +
+                     cstr(source_addr, 21) + struct.pack(">BB", dest_addr_ton, dest_addr_npi))
+        if not 0 <= esm_class <= 0xFF:
+            raise PDUError("esm_class must be 0-255")
+        self.esm_class = esm_class
+        self.mid = (struct.pack(">BB", protocol_id, priority_flag) +
+                    cstr(schedule_delivery_time, 17) + cstr(validity_period, 17) +
+                    struct.pack(">BB", registered_delivery, replace_if_present_flag))
+        self.sm_default_msg_id = sm_default_msg_id
+        self.tlvs = encode_tlvs(tlvs)
+
+    def build(self, seq, destination_addr, short_message, data_coding, esm_or=0, tlvs=b""):
+        if len(short_message) > 254:
+            raise PDUError("short_message longer than 254 octets; use message_payload")
+        body = b"".join((self.head, cstr(destination_addr, 21), bytes((self.esm_class | esm_or,)), self.mid,
+                         bytes((data_coding, self.sm_default_msg_id, len(short_message))), short_message,
+                         tlvs, self.tlvs))
+        return header(SUBMIT_SM, 0, seq, body)
+
+
+def submit_sm(seq, *, destination_addr="", data_coding=0, short_message=b"", tlvs=(), **fields):
+    return SubmitTemplate(**fields).build(seq, destination_addr, short_message, data_coding,
+                                          tlvs=encode_tlvs(tlvs))
 
 
 def simple(command_id, seq, status=0):

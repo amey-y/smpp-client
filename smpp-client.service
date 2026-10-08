@@ -3,12 +3,13 @@ Description=SMPP client / load tester (web GUI)
 After=network-online.target
 
 [Service]
-User=onexadmin
-WorkingDirectory=/home/onexadmin/onextel/smpp-client
+# adjust User and paths to where you installed the client
+User=smppclient
+WorkingDirectory=/opt/smpp-client
 Environment=SMPPCLIENT_PORT=8095
 # Environment=SMPPCLIENT_USER=admin
 # Environment=SMPPCLIENT_PASSWORD=change-me
-ExecStart=/home/onexadmin/onextel/smpp-client/run.sh
+ExecStart=/opt/smpp-client/run.sh
 Restart=on-failure
 LimitNOFILE=65536
 

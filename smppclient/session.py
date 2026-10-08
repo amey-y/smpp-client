@@ -1,5 +1,6 @@
 """One SMPP bind (one TCP connection) with windowing, keep-alive and auto-reconnect."""
 import asyncio
+import socket
 import ssl
 import struct
 import time
@@ -26,6 +27,7 @@ class Session:
         self.inflight = 0
         self.last_error = ""
         self.server_system_id = ""
+        self.server_version = None
         self.bound_since = None
         self.reconnects = 0
         self.backoff = 1.0
@@ -55,7 +57,7 @@ class Session:
     def snapshot(self):
         return {"index": self.index, "bind_type": self.bind_type, "state": self.state,
                 "inflight": self.inflight, "last_error": self.last_error,
-                "server_system_id": self.server_system_id,
+                "server_system_id": self.server_system_id, "server_version": self.server_version,
                 "uptime": round(time.time() - self.bound_since) if self.bound_since else None,
                 "reconnects": self.reconnects, "enquire_rtt_ms": self.enquire_rtt_ms,
                 "stats": dict(self.stats)}
@@ -155,8 +157,9 @@ class Session:
             timeout=p.get("connect_timeout", 10))
         sock = self.writer.get_extra_info("socket")
         if sock is not None:
-            import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # detect dead peers behind NAT/firewalls even if enquire_link is disabled server side
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.last_rx = time.monotonic()
 
     async def _read_pdu(self):
@@ -189,6 +192,8 @@ class Session:
                     raise BindRejected(status)
                 d = P.decode_body(cmd, body)
                 self.server_system_id = d.get("system_id", "")
+                ver = d.get("tlvs", {}).get(P.TLV_SC_INTERFACE_VERSION)
+                self.server_version = "%d.%d" % (ver[0] >> 4, ver[0] & 0x0F) if ver else None
                 return
             if cmd == P.GENERIC_NACK:
                 raise BindRejected(status)
@@ -236,6 +241,10 @@ class Session:
         elif cmd == P.UNBIND_RESP:
             if self._unbind_waiter and not self._unbind_waiter.done():
                 self._unbind_waiter.set_result(True)
+        elif cmd == P.ALERT_NOTIFICATION:
+            pass   # no response is allowed for alert_notification
+        elif cmd == P.OUTBIND:
+            self.conn.log("warn", "bind #%d: ignoring outbind on an already bound session" % self.index)
         elif cmd == P.GENERIC_NACK:
             self.stats["nack"] += 1
             entry = self.pending.pop(seq, None)
@@ -257,9 +266,14 @@ class Session:
         while True:
             await asyncio.sleep(0.5)
             now = time.monotonic()
-            # expire requests that never got an answer
+            # expire requests that never got an answer; pending is in send order, so stop at
+            # the first one that is still within the timeout
             if self.pending:
-                expired = [s for s, e in self.pending.items() if now - e[0] > resp_timeout]
+                expired = []
+                for s, e in self.pending.items():
+                    if now - e[0] <= resp_timeout:
+                        break
+                    expired.append(s)
                 for s in expired:
                     entry = self.pending.pop(s)
                     self.inflight -= 1

@@ -15,6 +15,7 @@ ENCODINGS = {
     "gsm7_packed": (0x00, "gsm7p"),  # SMSC default alphabet, packed septets
     "ascii": (0x01, "ascii"),        # IA5
     "latin1": (0x03, "latin1"),
+    "latin1_dc0": (0x00, "latin1"),  # Latin-1 octets as SMSC default alphabet (SMSC transcodes)
     "binary": (0x04, "binary"),      # message text is hex
     "ucs2": (0x08, "ucs2"),
 }
@@ -124,13 +125,25 @@ def encode_units(text, codec):
     raise ValueError(codec)
 
 
-def single_limit(codec):
-    return 160 if codec in ("gsm7", "gsm7p") else 140
+# udh length (octets) used per long-message mode; SAR parts get the UDH added by the SMSC
+UDH_LEN = {"udh": 6, "udh16": 7, "sar": 6}
 
 
-def part_limit(codec):
-    """Payload capacity per segment when a 6-byte UDH is present."""
-    return 153 if codec in ("gsm7", "gsm7p") else 134
+def counts_septets(name):
+    """True when segment limits are in GSM 7-bit characters (the SMSC sends them as GSM7)."""
+    return ENCODINGS[name][0] == 0x00
+
+
+def single_limit(name):
+    return 160 if counts_septets(name) else 140
+
+
+def part_limit(name, udh_len=6):
+    """Payload capacity per segment when a UDH of udh_len octets is present."""
+    if counts_septets(name):
+        return (140 - udh_len) * 8 // 7
+    n = 140 - udh_len
+    return n - n % 2 if ENCODINGS[name][1] == "ucs2" else n
 
 
 def segment_text(text, codec, limit):
@@ -163,7 +176,7 @@ class EncodedMessage:
 def build_message(text, encoding="auto", long_mode="udh", data_coding_override=None):
     """Encode text into one or more submit_sm payloads.
 
-    long_mode: udh | sar | payload | truncate
+    long_mode: udh | udh16 | sar | payload | truncate
     """
     name = resolve_encoding(text, encoding)
     data_coding, codec = ENCODINGS[name]
@@ -177,38 +190,63 @@ def build_message(text, encoding="auto", long_mode="udh", data_coding_override=N
         return EncodedMessage(data_coding, [(b"", 0, [(0x0424, raw)])], "payload")
 
     size = text_size(text, codec)
-    if size <= single_limit(codec):
+    if size <= single_limit(name):
         return EncodedMessage(data_coding, [(encode_units(text, codec), 0, [])], "single")
 
     if long_mode == "truncate":
-        part = segment_text(text, codec, single_limit(codec))[0]
+        part = segment_text(text, codec, single_limit(name))[0]
         return EncodedMessage(data_coding, [(encode_units(part, codec), 0, [])], "truncated")
 
     if long_mode == "payload":
         return EncodedMessage(data_coding, [(b"", 0, [(0x0424, encode_units(text, codec))])], "payload")
 
-    texts = segment_text(text, codec, part_limit(codec))
+    if long_mode not in UDH_LEN:
+        raise ValueError("unknown long message mode %r" % long_mode)
+    udh_len = UDH_LEN[long_mode]
+    texts = segment_text(text, codec, part_limit(name, udh_len))
     if len(texts) > 255:
         raise ValueError("message too long (%d segments)" % len(texts))
-    ref = random.randint(0, 255)
+    ref = random.randint(0, 0xFFFF if long_mode == "udh16" else 0xFF)
     total = len(texts)
     parts = []
     for i, t in enumerate(texts, 1):
         if long_mode == "sar":
             tlvs = [(0x020C, ref.to_bytes(2, "big")), (0x020E, bytes([total])), (0x020F, bytes([i]))]
             parts.append((encode_units(t, codec), 0, tlvs))
+            continue
+        if long_mode == "udh16":
+            udh = bytes([0x06, 0x08, 0x04, ref >> 8, ref & 0xFF, total, i])
         else:
             udh = bytes([0x05, 0x00, 0x03, ref, total, i])
-            if codec == "gsm7p":
-                # 6 octet UDH = 48 bits -> 1 fill bit to reach septet boundary (49 = 7*7)
-                payload = udh + pack_septets(gsm7_septets(t), fill_bits=1)
-            else:
-                payload = udh + encode_units(t, codec)
-            parts.append((payload, 0x40, []))
+        if codec == "gsm7p":
+            # pad the UDH to a septet boundary
+            payload = udh + pack_septets(gsm7_septets(t), fill_bits=(7 - len(udh) * 8 % 7) % 7)
+        else:
+            payload = udh + encode_units(t, codec)
+        parts.append((payload, 0x40, []))
     return EncodedMessage(data_coding, parts, long_mode)
 
 
-def message_info(text, encoding="auto"):
+def split_udh(data):
+    """Split a short_message that starts with a UDH. Returns (concat_info_or_None, body), where
+    concat_info is (ref, total, seq) from an 8- or 16-bit concatenation IE."""
+    if not data:
+        return None, data
+    udhl = data[0]
+    udh, body = data[1:1 + udhl], data[1 + udhl:]
+    i, concat = 0, None
+    while i + 2 <= len(udh):
+        iei, ln = udh[i], udh[i + 1]
+        ie = udh[i + 2:i + 2 + ln]
+        if iei == 0x00 and ln == 3:
+            concat = (ie[0], ie[1], ie[2])
+        elif iei == 0x08 and ln == 4:
+            concat = ((ie[0] << 8) | ie[1], ie[2], ie[3])
+        i += 2 + ln
+    return concat, body
+
+
+def message_info(text, encoding="auto", long_mode="udh"):
     """Character/segment statistics shown in the GUI."""
     name = resolve_encoding(text, encoding) if text else "gsm7"
     codec = ENCODINGS[name][1]
@@ -219,10 +257,11 @@ def message_info(text, encoding="auto"):
             return {"encoding": name, "units": 0, "segments": 0, "error": "invalid hex"}
         return {"encoding": name, "units": n, "segments": 1 if n <= 140 else -(-n // 134)}
     size = text_size(text, codec)
-    if size <= single_limit(codec):
+    plimit = part_limit(name, UDH_LEN.get(long_mode, 6))
+    if size <= single_limit(name):
         segs = 1
     else:
-        segs = len(segment_text(text, codec, part_limit(codec)))
+        segs = len(segment_text(text, codec, plimit))
     return {"encoding": name, "units": size, "chars": len(text), "segments": segs,
             "unit_name": "septets" if codec.startswith("gsm7") else "octets",
-            "single_limit": single_limit(codec), "part_limit": part_limit(codec)}
+            "single_limit": single_limit(name), "part_limit": plimit}

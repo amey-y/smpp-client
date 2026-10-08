@@ -2,7 +2,8 @@
 
 Features: accepts any credentials (or a fixed system_id/password), limits binds per system_id,
 optional per-bind TPS throttle (returns ESME_RTHROTTLED), random reject rate, response delay,
-and delivery receipts with a configurable delay and status mix.
+and delivery receipts with a configurable delay and status mix. Receipts go back on the TRX bind that
+submitted the message, or on an RX/TRX bind of the same system_id for TX binds.
 
 Standalone:  python -m smppclient.mock_smsc --port 2775 --max-binds 10
 """
@@ -30,6 +31,7 @@ class MockSMSC:
         self.log = log
         self.server = None
         self.binds = collections.Counter()
+        self.receivers = collections.defaultdict(list)   # system_id -> [(send, next_seq)] of RX/TRX binds
         self.clients = set()
         self.c = collections.Counter()
 
@@ -49,6 +51,7 @@ class MockSMSC:
             await self.server.wait_closed()
             self.server = None
             self.binds.clear()
+            self.receivers.clear()
             self.log("info", "mock SMSC stopped")
 
     def snapshot(self):
@@ -61,6 +64,7 @@ class MockSMSC:
         seq = [0]
         window = collections.deque()
         tasks = set()
+        rx_entry = None
 
         def send(data):
             if not writer.is_closing():
@@ -99,6 +103,9 @@ class MockSMSC:
                         send(P.header(resp_cmd, 0x0D, sq, b"\x00"))
                     else:
                         bound_as = (sid, cmd)
+                        if cmd != P.BIND_TRANSMITTER:
+                            rx_entry = (send, next_seq)
+                            self.receivers[sid].append(rx_entry)
                         self.binds[sid] += 1
                         self.c["binds"] += 1
                         send(P.header(resp_cmd, 0, sq, P.cstr("MOCKSMSC")))
@@ -129,9 +136,8 @@ class MockSMSC:
                         spawn(later(delay, resp))
                     else:
                         send(resp)
-                    if self.cfg["send_dlr"] and d.get("registered_delivery", 0) & 0x03 and \
-                            bound_as[1] == P.BIND_TRANSCEIVER:
-                        spawn(self._dlr(send, next_seq, d, msg_id))
+                    if self.cfg["send_dlr"] and d.get("registered_delivery", 0) & 0x03:
+                        spawn(self._dlr(bound_as[0], rx_entry, d, msg_id))
                 elif cmd == P.ENQUIRE_LINK:
                     send(P.simple(P.ENQUIRE_LINK_RESP, sq))
                 elif cmd == P.UNBIND:
@@ -147,6 +153,10 @@ class MockSMSC:
         finally:
             for t in tasks:
                 t.cancel()
+            if rx_entry is not None:
+                self.receivers[bound_as[0]].remove(rx_entry)
+                if not self.receivers[bound_as[0]]:
+                    del self.receivers[bound_as[0]]
             if bound_as:
                 self.binds[bound_as[0]] -= 1
                 if self.binds[bound_as[0]] <= 0:
@@ -154,8 +164,13 @@ class MockSMSC:
             self.clients.discard(writer)
             writer.close()
 
-    async def _dlr(self, send, next_seq, d, msg_id):
+    async def _dlr(self, system_id, own, d, msg_id):
         await asyncio.sleep(float(self.cfg["dlr_delay_ms"]) / 1000.0 * random.uniform(0.5, 1.5))
+        target = own or (random.choice(self.receivers[system_id]) if self.receivers.get(system_id) else None)
+        if target is None:
+            self.c["dlr_no_receiver"] += 1
+            return
+        send, next_seq = target
         undeliv = random.random() < float(self.cfg["dlr_undeliv_rate"])
         stat, err, dlvrd = ("UNDELIV", "001", "000") if undeliv else ("DELIVRD", "000", "001")
         ts = time.strftime("%y%m%d%H%M")
@@ -172,7 +187,7 @@ class MockSMSC:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Mock SMPP server")
+    ap = argparse.ArgumentParser(prog="smppclient mock", description="Mock SMPP server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=2775)
     ap.add_argument("--system-id", default="")

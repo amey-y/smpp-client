@@ -5,6 +5,7 @@ import base64
 import hmac
 import json
 import os
+import struct
 import uuid
 
 from aiohttp import web, WSMsgType
@@ -27,7 +28,7 @@ def api(handler):
             return await handler(request)
         except web.HTTPException:
             raise
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, struct.error) as e:
             return jresp({"error": str(e).strip("'\"")}, 400)
         except Exception as e:
             request.app["mgr"].log("error", "API %s failed: %s: %s" % (request.path, type(e).__name__, e))
@@ -40,6 +41,8 @@ def make_auth_middleware(user, password):
 
     @web.middleware
     async def auth(request, handler):
+        if request.path == "/healthz":
+            return await handler(request)
         if not hmac.compare_digest(request.headers.get("Authorization", ""), expected):
             return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="SMPP Client"'})
         return await handler(request)
@@ -52,6 +55,54 @@ routes = web.RouteTableDef()
 @routes.get("/")
 async def index(request):
     return web.FileResponse(os.path.join(STATIC_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
+
+
+@routes.get("/healthz")
+async def healthz(request):
+    return jresp({"ok": True})
+
+
+def _label(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+@routes.get("/metrics")
+async def metrics(request):
+    """Prometheus text exposition of per-connection counters."""
+    mgr = request.app["mgr"]
+    series = {
+        "binds_bound": ("gauge", "Bound SMPP sessions"),
+        "binds_total": ("gauge", "Configured SMPP sessions"),
+        "inflight": ("gauge", "submit_sm awaiting a response"),
+        "submit_total": ("counter", "submit_sm PDUs sent"),
+        "resp_ok_total": ("counter", "submit_sm_resp with ESME_ROK"),
+        "resp_err_total": ("counter", "submit_sm_resp with an error status"),
+        "timeout_total": ("counter", "submit_sm without a response in time"),
+        "dlr_total": ("counter", "Delivery receipts received"),
+        "mo_total": ("counter", "Mobile originated messages received"),
+    }
+    values = {k: [] for k in series}
+    for c in mgr.connections.values():
+        lbl = '{connection="%s"}' % _label(c.profile["name"])
+        values["binds_bound"].append((lbl, c.bound_count()))
+        values["binds_total"].append((lbl, len(c.sessions)))
+        values["inflight"].append((lbl, sum(s.inflight for s in c.sessions)))
+        values["submit_total"].append((lbl, sum(s.stats["submit"] for s in c.sessions)))
+        values["resp_ok_total"].append((lbl, c.c["ok"]))
+        values["resp_err_total"].append((lbl, c.c["err"]))
+        values["timeout_total"].append((lbl, c.c["timeout"]))
+        values["dlr_total"].append((lbl, c.c["dlr"]))
+        values["mo_total"].append((lbl, c.c["mo"]))
+    out = []
+    for k, (typ, help_) in series.items():
+        out += ["# HELP smppclient_%s %s" % (k, help_), "# TYPE smppclient_%s %s" % (k, typ)]
+        out += ["smppclient_%s%s %s" % (k, lbl, v) for lbl, v in values[k]]
+    active = sum(1 for j in mgr.jobs.values() if j.state in ("running", "paused", "stopping", "pending"))
+    out += ["# TYPE smppclient_jobs_active gauge", "smppclient_jobs_active %d" % active,
+            "# TYPE smppclient_unmatched_dlr_total counter", "smppclient_unmatched_dlr_total %d" % mgr.unmatched_dlr,
+            "# TYPE smppclient_tracked_msgids gauge", "smppclient_tracked_msgids %d" % len(mgr.msgids)]
+    return web.Response(text="\n".join(out) + "\n", content_type="text/plain", charset="utf-8",
+                        headers={"X-Content-Type-Options": "nosniff"})
 
 
 @routes.get("/api/state")
@@ -230,7 +281,7 @@ async def upload(request):
 @api
 async def msginfo(request):
     body = await request.json()
-    return jresp(message_info(body.get("text", ""), body.get("encoding", "auto")))
+    return jresp(message_info(body.get("text", ""), body.get("encoding", "auto"), body.get("long_mode", "udh")))
 
 
 @routes.post("/api/templates")
@@ -360,7 +411,7 @@ def build_app(user=None, password=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="SMPP client / load tester with web GUI")
+    ap = argparse.ArgumentParser(prog="smppclient", description="SMPP client / load tester with web GUI")
     ap.add_argument("--host", default=os.environ.get("SMPPCLIENT_HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("SMPPCLIENT_PORT", "8095")))
     ap.add_argument("--user", default=os.environ.get("SMPPCLIENT_USER"))

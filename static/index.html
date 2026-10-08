@@ -72,12 +72,12 @@
               <button data-src="csv">CSV upload</button>
             </div>
             <div data-pane="single">
-              <label class="f"><span>Destination number</span><input id="s-single" placeholder="e.g. 919876543210" autocomplete="off"></label>
+              <label class="f"><span>Destination number</span><input id="s-single" placeholder="e.g. 15551234567" autocomplete="off"></label>
               <div class="hint" style="margin-top:6px">Leading + / 00, spaces and dashes are stripped.</div>
             </div>
             <div data-pane="list" hidden>
               <label class="f"><span>Destination numbers — one per line (commas/semicolons also accepted)</span>
-                <textarea id="s-list" rows="9" placeholder="919876543210&#10;919876543211"></textarea></label>
+                <textarea id="s-list" rows="9" placeholder="15551234567&#10;447700900123"></textarea></label>
               <div class="row" style="margin-top:6px">
                 <label class="c"><input type="checkbox" id="s-dedupe" checked> Remove duplicates</label>
                 <span class="hint" id="s-list-count"></span>
@@ -86,9 +86,9 @@
             <div data-pane="generate" hidden>
               <div class="form">
                 <label class="f"><span>How many numbers</span><input id="g-count" type="number" min="1" value="100"></label>
-                <label class="f"><span>Country code</span><input id="g-cc" value="91" placeholder="91"></label>
+                <label class="f"><span>Country code</span><input id="g-cc" value="" placeholder="e.g. 1, 44, 91"></label>
                 <label class="f"><span>Number length (without country code)</span><input id="g-len" type="number" min="3" max="15" value="10"></label>
-                <label class="f"><span>Prefixes (comma separated, optional)</span><input id="g-prefix" value="98,97,96,70,80,90" placeholder="98,97"></label>
+                <label class="f"><span>Prefixes (comma separated, optional)</span><input id="g-prefix" value="" placeholder="e.g. 70,71,72"></label>
                 <label class="f"><span>Mode</span><select id="g-mode"><option value="random">Random</option><option value="sequential">Sequential</option></select></label>
                 <label class="f"><span>Sequential start offset</span><input id="g-start" type="number" min="0" value="0"></label>
                 <label class="c wide"><input type="checkbox" id="g-unique" checked> Unique numbers only</label>
@@ -114,7 +114,7 @@
             <h2>Message</h2>
             <div class="form">
               <label class="f"><span>Connection</span><select id="s-conn"></select></label>
-              <label class="f"><span>Sender ID (source_addr)</span><input id="s-src" value="ONEXTL" maxlength="20"></label>
+              <label class="f"><span>Sender ID (source_addr)</span><input id="s-src" value="TEST" maxlength="20"></label>
               <label class="f wide"><span>Text <span class="grow"></span></span>
                 <textarea id="s-text" rows="5" placeholder="Your message. Placeholders: {number} {seq} {otp} {rand:4} {uuid:8} {time} {date} {job}">Dear customer, your OTP is {otp}. Do not share it with anyone.</textarea></label>
             </div>
@@ -124,26 +124,23 @@
               <label class="f"><span>Encoding / data_coding</span><select id="s-enc">
                 <option value="auto">Auto (GSM7 or UCS2)</option><option value="gsm7">GSM 03.38 7-bit (DC 0, unpacked)</option>
                 <option value="gsm7_packed">GSM 7-bit packed (DC 0)</option><option value="ascii">IA5 / ASCII (DC 1)</option>
-                <option value="latin1">Latin-1 (DC 3)</option><option value="ucs2">UCS2 / Unicode (DC 8)</option>
+                <option value="latin1">Latin-1 (DC 3)</option><option value="latin1_dc0">Latin-1 as SMSC default (DC 0)</option><option value="ucs2">UCS2 / Unicode (DC 8)</option>
                 <option value="binary">Binary – text is hex (DC 4)</option></select></label>
               <label class="f"><span>Long message mode</span><select id="s-long">
-                <option value="udh">Concatenate – UDH (esm_class 0x40)</option><option value="sar">Concatenate – SAR TLVs</option>
+                <option value="udh">Concatenate – UDH 8-bit ref (esm_class 0x40)</option><option value="udh16">Concatenate – UDH 16-bit ref (esm_class 0x40)</option><option value="sar">Concatenate – SAR TLVs</option>
                 <option value="payload">Single PDU – message_payload TLV</option><option value="truncate">Truncate to 1 segment</option></select></label>
               <label class="f"><span>Delivery receipt</span><select id="s-dlr">
                 <option value="1">Request DLR (success + failure)</option><option value="2">Failure only</option>
                 <option value="17">Final + intermediate</option><option value="0">No DLR</option></select></label>
             </div>
             <details class="adv">
-              <summary>DLT / TLV parameters</summary>
-              <div class="form">
-                <label class="f"><span>Entity / PE ID (0x1400)</span><input id="s-dlt-pe" placeholder="1201159xxxxxxxxxx"></label>
-                <label class="f"><span>Template ID (0x1401)</span><input id="s-dlt-tpl" placeholder="1207161xxxxxxxxxx"></label>
-                <label class="f"><span>TM ID (0x1402)</span><input id="s-dlt-tm"></label>
-                <label class="c"><input type="checkbox" id="s-dlt-nul"> NUL-terminate DLT values</label>
-              </div>
-              <h3>Custom TLVs</h3>
+              <summary>Optional TLVs</summary>
+              <div class="hint" style="margin-bottom:8px">Extra optional parameters added to every submit_sm. Tags and formats differ between SMSCs; check your provider's spec.</div>
               <div id="tlv-rows"></div>
-              <button class="btn sm" id="tlv-add">+ Add TLV</button>
+              <div class="row">
+                <button class="btn sm" id="tlv-add">+ Add TLV</button>
+                <select id="tlv-preset" style="width:auto"></select>
+              </div>
             </details>
             <details class="adv">
               <summary>Advanced submit_sm fields</summary>
@@ -282,8 +279,8 @@
         <label class="f"><span>Profile name</span><input name="name" required></label>
         <label class="f"><span>Host</span><input name="host" required></label>
         <label class="f"><span>Port</span><input name="port" type="number" required></label>
-        <label class="f"><span>system_id</span><input name="system_id" maxlength="15" autocomplete="off"></label>
-        <label class="f"><span>password</span><input name="password" type="password" maxlength="8" autocomplete="new-password" placeholder=""></label>
+        <label class="f"><span>system_id</span><input name="system_id" maxlength="64" autocomplete="off"></label>
+        <label class="f"><span>password</span><input name="password" type="password" maxlength="64" autocomplete="new-password" placeholder=""></label>
         <label class="f"><span>system_type</span><input name="system_type" maxlength="12"></label>
         <label class="f"><span>Bind type</span><select name="bind_type"><option value="TRX">Transceiver (TRX)</option><option value="TX">Transmitter (TX)</option><option value="RX">Receiver (RX)</option></select></label>
         <label class="f"><span>Number of binds</span><input name="binds" type="number" min="0" max="100"></label>
@@ -292,6 +289,7 @@
         <label class="f"><span>enquire_link interval (s)</span><input name="enquire_interval" type="number" min="1"></label>
         <label class="f"><span>Response timeout (s)</span><input name="response_timeout" type="number" min="1"></label>
         <label class="f"><span>Bind timeout (s)</span><input name="bind_timeout" type="number" min="1"></label>
+        <label class="f"><span>Max TPS for this account (0 = no cap)</span><input name="max_tps" type="number" min="0"></label>
         <label class="f"><span>Delay between binds (ms)</span><input name="bind_stagger_ms" type="number" min="0"></label>
         <label class="f"><span>interface_version</span><select name="interface_version"><option value="52">3.4 (0x34)</option><option value="51">3.3 (0x33)</option><option value="80">5.0 (0x50)</option></select></label>
         <label class="f"><span>addr_ton</span><input name="addr_ton" type="number" min="0" max="6"></label>
@@ -301,6 +299,7 @@
         <label class="c"><input type="checkbox" name="tls"> TLS</label>
         <label class="c"><input type="checkbox" name="tls_verify"> Verify TLS cert</label>
       </div>
+      <p class="hint">SMPP 3.4 limits system_id to 15 and password to 8 characters. Longer values are sent unchanged, for servers that accept them. Max TPS is shared by all jobs on this connection.</p>
       <p class="hint" id="conn-pass-hint"></p>
     </div>
     <div class="df">

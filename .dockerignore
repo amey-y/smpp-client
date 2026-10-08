@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+data
+**/__pycache__
+**/*.pyc
+Dockerfile
+docker-compose.yml
+.dockerignore
+smpp-client.service
+run.sh

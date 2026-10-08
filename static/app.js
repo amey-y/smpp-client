@@ -270,7 +270,8 @@ function renderConnections() {
     const p = c.profile;
     setHTML(card.querySelector(".cname"), esc(p.name));
     setHTML(card.querySelector(".cstat"), `<span class="pill"><span class="dot ${c.bound === c.total && c.total ? "ok" : c.bound ? "warn" : ""}"></span>${c.bound}/${c.total} bound</span>`);
-    setHTML(card.querySelector(".cinfo"), `${esc(p.host)}:${p.port} · system_id <b>${esc(p.system_id)}</b> · ${p.bind_type} × ${p.binds}${p.rx_binds ? ` + RX × ${p.rx_binds}` : ""} · window ${p.window} · enquire ${p.enquire_interval}s · ${p.tls ? "TLS" : "plain TCP"} · in flight ${fmt(c.inflight)} · ${fmt(c.rate.submit)} submit/s`);
+    const srv = c.sessions.find((s) => s.server_system_id || s.server_version);
+    setHTML(card.querySelector(".cinfo"), `${esc(p.host)}:${p.port} · system_id <b>${esc(p.system_id)}</b> · ${p.bind_type} × ${p.binds}${p.rx_binds ? ` + RX × ${p.rx_binds}` : ""} · window ${p.window} · enquire ${p.enquire_interval}s${p.max_tps ? ` · max ${fmt(p.max_tps)} TPS` : ""} · ${p.tls ? "TLS" : "plain TCP"} · in flight ${fmt(c.inflight)} · ${fmt(c.rate.submit)} submit/s${srv ? ` · server <b>${esc(srv.server_system_id || "?")}</b>${srv.server_version ? ` (SMPP ${esc(srv.server_version)})` : ""}` : ""}`);
     card.querySelector('[data-act="trace"]').checked = c.trace;
     const rows = c.sessions.map((s) => ({
       key: s.index,
@@ -350,7 +351,8 @@ $("#conn-form").addEventListener("submit", async (e) => {
 // ======================================================================= send: message info
 const GSM_BASIC = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\u001bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà";
 const GSM_EXT = "\f^{}\\[~]|€";
-function msgInfo(text, enc) {
+const UDH_LEN = { udh: 6, udh16: 7, sar: 6 };
+function msgInfo(text, enc, long = "udh") {
   const isGsm = [...text].every((c) => (GSM_BASIC.includes(c) && c !== "\u001b") || GSM_EXT.includes(c));
   let name = enc === "auto" ? (isGsm ? "gsm7" : "ucs2") : enc;
   if (name === "binary") {
@@ -358,21 +360,24 @@ function msgInfo(text, enc) {
     return { name, units: n, unit: "octets", segs: n <= 140 ? 1 : Math.ceil(n / 134), single: 140, part: 134, warn: /^[0-9a-f\s]*$/i.test(text) ? "" : "invalid hex" };
   }
   const gsm = name.startsWith("gsm7");
+  const septetLimits = gsm || name === "latin1_dc0";   // DC 0: the SMSC sends it as GSM 7-bit
   const w = [...text].map((c) => (gsm ? (GSM_EXT.includes(c) ? 2 : 1) : name === "ucs2" ? (c.codePointAt(0) > 0xffff ? 4 : 2) : 1));
   const total = w.reduce((a, b) => a + b, 0);
-  const single = gsm ? 160 : 140, part = gsm ? 153 : 134;
+  const udh = UDH_LEN[long] || 6;
+  const single = septetLimits ? 160 : 140;
+  const part = septetLimits ? Math.floor(((140 - udh) * 8) / 7) : name === "ucs2" ? (140 - udh) & ~1 : 140 - udh;
   let segs = 1;
   if (total > single) { segs = 1; let cur = 0; for (const x of w) { if (cur + x > part) { segs++; cur = 0; } cur += x; } }
   let warn = "";
   if (gsm && !isGsm) warn = "contains characters outside GSM 03.38 – they will be sent as '?'";
-  if ((name === "latin1" || name === "ascii") && [...text].some((c) => c.charCodeAt(0) > (name === "ascii" ? 127 : 255))) warn = `contains characters not representable in ${name}`;
+  if (["latin1", "latin1_dc0", "ascii"].includes(name) && [...text].some((c) => c.charCodeAt(0) > (name === "ascii" ? 127 : 255))) warn = `contains characters not representable in ${name === "ascii" ? "ASCII" : "Latin-1"}`;
   return { name, units: total, unit: gsm ? "septets" : "octets", segs, single, part, chars: [...text].length, warn };
 }
 
 function updateCounter() {
   const text = $("#s-text").value, enc = $("#s-enc").value;
-  const i = msgInfo(text, enc);
   const long = $("#s-long").value;
+  const i = msgInfo(text, enc, long);
   const pdus = i.segs > 1 && (long === "payload" || long === "truncate") ? 1 : i.segs;
   const left = i.segs === 1 ? i.single - i.units : i.part * i.segs - i.units;
   $("#s-counter").innerHTML = `<span>Encoding <b>${i.name.toUpperCase()}</b></span><span><b>${fmt(i.chars ?? i.units)}</b> chars</span><span><b>${fmt(i.units)}</b> ${i.unit}</span>
@@ -410,13 +415,38 @@ function addTlvRow(t = { tag: "0x", format: "string", value: "" }) {
   const d = document.createElement("div");
   d.className = "row tlv-row";
   d.style.marginBottom = "6px";
+  d.dataset.label = t.label || "";
   d.innerHTML = `<input class="t-tag" placeholder="tag e.g. 0x1403" style="width:130px" value="${esc(t.tag)}">
     <select class="t-fmt" style="width:120px">${["string", "cstring", "hex", "int8", "int16", "int32"].map((f) => `<option ${f === t.format ? "selected" : ""}>${f}</option>`).join("")}</select>
-    <input class="t-val" placeholder="value" style="flex:1;min-width:120px" value="${esc(t.value)}">
+    <input class="t-val" placeholder="${esc(t.label || "value")}" title="${esc(t.label || "")}" style="flex:1;min-width:120px" value="${esc(t.value)}">
     <button class="btn sm danger t-del">✕</button>`;
   $("#tlv-rows").appendChild(d);
 }
 $("#tlv-add").addEventListener("click", () => addTlvRow());
+
+// common optional parameters; vendor-specific tags (0x1400–0x3FFF) vary between SMSCs
+const TLV_PRESETS = {
+  "India DLT (PE ID / Template ID / TM ID)": [
+    { tag: "0x1400", format: "string", label: "DLT Entity / PE ID" },
+    { tag: "0x1401", format: "string", label: "DLT Template ID" },
+    { tag: "0x1402", format: "string", label: "DLT TM ID (optional)" }],
+  "user_message_reference (0x0204)": [{ tag: "0x0204", format: "int16", label: "user_message_reference" }],
+  "source_port / destination_port (0x020A / 0x020B)": [
+    { tag: "0x020A", format: "int16", label: "source_port" }, { tag: "0x020B", format: "int16", label: "destination_port" }],
+  "language_indicator (0x020D)": [{ tag: "0x020D", format: "int8", label: "language_indicator" }],
+  "payload_type (0x0019)": [{ tag: "0x0019", format: "int8", label: "payload_type (0 = default, 1 = WCMP)" }],
+  "callback_num (0x0381)": [{ tag: "0x0381", format: "hex", label: "callback_num (hex: digit mode, TON, NPI, digits)" }],
+  "ussd_service_op (0x0501)": [{ tag: "0x0501", format: "int8", label: "ussd_service_op" }],
+  "alert_on_message_delivery (0x130C)": [{ tag: "0x130C", format: "hex", label: "(no value)" }],
+};
+$("#tlv-preset").innerHTML = `<option value="">Add preset…</option>` + Object.keys(TLV_PRESETS).map((k) => `<option>${esc(k)}</option>`).join("");
+$("#tlv-preset").addEventListener("change", (e) => {
+  const p = TLV_PRESETS[e.target.value];
+  e.target.value = "";
+  if (!p) return;
+  for (const t of p) if (!$$(".tlv-row .t-tag").some((el) => el.value.toLowerCase() === t.tag.toLowerCase())) addTlvRow({ ...t, value: "" });
+  onSendFormChange();
+});
 $("#tlv-rows").addEventListener("click", (e) => { if (e.target.classList.contains("t-del")) { e.target.closest(".tlv-row").remove(); onSendFormChange(); } });
 
 // recipients tabs
@@ -518,19 +548,24 @@ function onSendFormChange() {
 }
 
 const SEND_FIELDS = ["s-single", "s-list", "s-dedupe", "g-count", "g-cc", "g-len", "g-prefix", "g-mode", "g-start", "g-unique", "csv-numcol", "csv-msgcol", "csv-dedupe",
-  "s-src", "s-text", "s-enc", "s-long", "s-dlr", "s-dlt-pe", "s-dlt-tpl", "s-dlt-tm", "s-dlt-nul", "s-ston", "s-snpi", "s-dton", "s-dnpi", "s-svc", "s-esm", "s-pid",
+  "s-src", "s-text", "s-enc", "s-long", "s-dlr", "s-ston", "s-snpi", "s-dton", "s-dnpi", "s-svc", "s-esm", "s-pid",
   "s-prio", "s-dc", "s-valid", "s-sched", "s-tps", "s-ramp", "s-repeat", "s-duration", "s-max", "s-retries", "s-conn"];
 function formValues(fields = SEND_FIELDS) {
   const v = {};
   for (const id of fields) { const el = $("#" + id); v[id] = el.type === "checkbox" ? el.checked : el.value; }
-  v.tlvs = $$(".tlv-row").map((r) => ({ tag: $(".t-tag", r).value, format: $(".t-fmt", r).value, value: $(".t-val", r).value }));
+  v.tlvs = $$(".tlv-row").map((r) => ({ tag: $(".t-tag", r).value, format: $(".t-fmt", r).value, value: $(".t-val", r).value, label: r.dataset.label }));
   v.source = source;
   return v;
 }
 function applyValues(v) {
   for (const id of SEND_FIELDS) { const el = $("#" + id); if (!el || !(id in v)) continue; if (el.type === "checkbox") el.checked = !!v[id]; else el.value = v[id]; }
   $("#tlv-rows").innerHTML = "";
-  (v.tlvs || []).forEach(addTlvRow);
+  const tlvs = [...(v.tlvs || [])];
+  // forms saved before DLT became a TLV preset
+  const fmt0 = v["s-dlt-nul"] ? "cstring" : "string";
+  for (const [id, tag, label] of [["s-dlt-pe", "0x1400", "DLT Entity / PE ID"], ["s-dlt-tpl", "0x1401", "DLT Template ID"], ["s-dlt-tm", "0x1402", "DLT TM ID (optional)"]])
+    if (v[id]) tlvs.push({ tag, format: fmt0, value: v[id], label });
+  tlvs.forEach(addTlvRow);
   if (v.source) setSource(v.source);
 }
 let saveTimer = null;
@@ -578,8 +613,7 @@ function buildSpec() {
     source_ton: +v["s-ston"], source_npi: +v["s-snpi"], dest_ton: +v["s-dton"], dest_npi: +v["s-dnpi"],
     service_type: v["s-svc"], esm_class: +v["s-esm"] || 0, protocol_id: +v["s-pid"] || 0, priority: +v["s-prio"] || 0,
     data_coding_override: v["s-dc"] === "" ? null : +v["s-dc"], validity_period: v["s-valid"], schedule_delivery_time: v["s-sched"],
-    dlt_entity_id: v["s-dlt-pe"], dlt_template_id: v["s-dlt-tpl"], dlt_tm_id: v["s-dlt-tm"], dlt_null_terminate: v["s-dlt-nul"],
-    custom_tlvs: v.tlvs.filter((t) => t.tag && t.tag !== "0x"),
+    custom_tlvs: v.tlvs.filter((t) => t.tag && t.tag !== "0x" && (t.value !== "" || t.format === "hex")).map(({ tag, format, value }) => ({ tag, format, value })),
     tps: source === "single" ? 0 : +v["s-tps"] || 0, ramp_seconds: +v["s-ramp"] || 0, max_retries: +v["s-retries"] || 0,
   };
   if (source === "single") spec.numbers = v["s-single"];
@@ -741,7 +775,7 @@ function renderInbound() {
   if (!t.tHead) t.innerHTML = `<thead><tr><th>Time</th><th>Type</th><th>Conn / bind</th><th>From</th><th>To</th><th>message_id</th><th>Stat</th><th>Err</th><th>Job</th><th>Text</th></tr></thead><tbody></tbody>`;
   syncRows(t.tBodies[0], rows.map((r) => ({
     key: r.id,
-    cells: [tstr(r.t), r.kind, `${esc(r.conn)} #${r.bind}`, `<span class="mono">${esc(r.src)}</span>`, `<span class="mono">${esc(r.dst)}</span>`, `<span class="mono small">${esc(r.msg_id || "")}</span>`,
+    cells: [tstr(r.t), r.parts ? `${r.kind} <span class="muted small">(${esc(r.parts)} parts)</span>` : r.kind, `${esc(r.conn)} #${r.bind}`, `<span class="mono">${esc(r.src)}</span>`, `<span class="mono">${esc(r.dst)}</span>`, `<span class="mono small">${esc(r.msg_id || "")}</span>`,
       r.stat ? `<b class="${r.stat === "DELIVRD" ? "ok-t" : "err-t"}">${esc(r.stat)}</b>` : "", esc(r.err || ""), r.job ? `<span class="mono small">${r.job}</span>` : "", { html: esc(r.text), cls: "wrap small" }],
   })));
 }

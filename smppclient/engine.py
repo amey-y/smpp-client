@@ -7,27 +7,36 @@ import json
 import os
 import random
 import re
+import sys
 import time
 import uuid
 
 from . import pdu as P
-from .encoding import build_message, decode_text
+from .encoding import build_message, decode_text, split_udh
 from .session import Session
 
 DATA_DIR = os.environ.get("SMPPCLIENT_DATA", os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "data"))
+LOG_STDOUT = os.environ.get("SMPPCLIENT_LOG_STDOUT", "1").lower() not in ("0", "false", "no", "")
 
 DEFAULT_PROFILE = {
     "name": "default", "host": "127.0.0.1", "port": 2775, "system_id": "", "password": "",
     "system_type": "", "interface_version": 0x34, "addr_ton": 0, "addr_npi": 0, "address_range": "",
     "bind_type": "TRX", "binds": 1, "rx_binds": 0, "window": 50, "enquire_interval": 30,
     "response_timeout": 30, "bind_timeout": 10, "connect_timeout": 10, "reconnect": True,
-    "tls": False, "tls_verify": False, "bind_stagger_ms": 100,
+    "tls": False, "tls_verify": False, "bind_stagger_ms": 100, "max_tps": 0,
 }
 
 RETRYABLE = {0x58, 0x14}   # ESME_RTHROTTLED, ESME_RMSGQFUL
 DLR_RE = re.compile(r"id:(?P<id>\S+).*?stat:(?P<stat>\w+)(?:.*?err:(?P<err>\w+))?", re.I | re.S)
 SERIES_LEN = 300
+DLR_ESM_TYPES = (0x04, 0x08, 0x20)   # SMSC delivery receipt, SME delivery ack, intermediate notification
+MO_PART_TTL = 600                    # seconds to wait for the missing parts of a concatenated MO
+
+
+def _canon_msgid(msg_id):
+    """SMSCs disagree on case and zero padding of message ids between submit_sm_resp and DLR."""
+    return msg_id.strip().lower().lstrip("0") or "0"
 
 
 def now_ms():
@@ -261,6 +270,18 @@ class Job:
         self.finished = None
         self.planned_messages = 0
         self.limiter = RateLimiter(spec.get("tps", 0), spec.get("ramp_seconds", 0))
+        self.want_dlr = bool(int(spec.get("registered_delivery", 1)) & 0x03)
+        self.template = P.SubmitTemplate(
+            service_type=spec.get("service_type", ""),
+            source_addr_ton=int(spec.get("source_ton", 5)), source_addr_npi=int(spec.get("source_npi", 0)),
+            source_addr=spec.get("source_addr", ""),
+            dest_addr_ton=int(spec.get("dest_ton", 1)), dest_addr_npi=int(spec.get("dest_npi", 1)),
+            esm_class=int(spec.get("esm_class", 0)), protocol_id=int(spec.get("protocol_id", 0)),
+            priority_flag=int(spec.get("priority", 0)),
+            schedule_delivery_time=spec.get("schedule_delivery_time", ""),
+            validity_period=spec.get("validity_period", ""),
+            registered_delivery=int(spec.get("registered_delivery", 1)),
+            tlvs=manager.static_tlvs(spec))
         self.paused = asyncio.Event()
         self.paused.set()
         self.stop_flag = False
@@ -410,16 +431,16 @@ class Job:
             if self.stop_flag:
                 return False
             await self.limiter.acquire()
+            await self.conn.limiter.acquire()   # account-wide cap shared by all jobs on this connection
             session = await self.conn.acquire(self)
             if session is None:
                 return False
             if not self.paused.is_set():
                 continue
             break
-        spec = self.spec
-        build = self._builder(item, spec)
+        tpl, tlvs = self.template, P.encode_tlvs(item.tlvs) if item.tlvs else b""
         try:
-            session.submit(build, item)
+            session.submit(lambda seq: tpl.build(seq, item.dest, item.payload, item.dc, item.esm, tlvs), item)
         except Exception as e:
             self.c["submitted"] += 1
             self.c["lost"] += 1
@@ -428,23 +449,6 @@ class Job:
         item.submitted_at = time.time()
         self.c["submitted"] += 1
         return True
-
-    def _builder(self, item, spec):
-        tlvs = list(item.tlvs) + self.manager.static_tlvs(spec)
-
-        def build(seq):
-            return P.submit_sm(
-                seq, service_type=spec.get("service_type", ""),
-                source_addr_ton=int(spec.get("source_ton", 5)), source_addr_npi=int(spec.get("source_npi", 0)),
-                source_addr=spec.get("source_addr", ""),
-                dest_addr_ton=int(spec.get("dest_ton", 1)), dest_addr_npi=int(spec.get("dest_npi", 1)),
-                destination_addr=item.dest, esm_class=int(spec.get("esm_class", 0)) | item.esm,
-                protocol_id=int(spec.get("protocol_id", 0)), priority_flag=int(spec.get("priority", 0)),
-                schedule_delivery_time=spec.get("schedule_delivery_time", ""),
-                validity_period=spec.get("validity_period", ""),
-                registered_delivery=int(spec.get("registered_delivery", 1)),
-                data_coding=item.dc, short_message=item.payload, tlvs=tlvs)
-        return build
 
     # ---------------------------------------------------------- callbacks
     def on_resp(self, session, item, status, msg_id, latency):
@@ -460,7 +464,7 @@ class Job:
         self.latency.append(latency)
         if status == 0:
             self.c["ok"] += 1
-            if int(self.spec.get("registered_delivery", 1)) & 0x03 and msg_id:
+            if self.want_dlr and msg_id:
                 self.manager.track_msg_id(msg_id, self, item.dest)
         else:
             self.c["err"] += 1
@@ -570,6 +574,7 @@ class Connection:
         self.rr = 0
         self.trace = False
         self.capacity = asyncio.Event()
+        self.limiter = RateLimiter(self.profile.get("max_tps", 0))
         self.c = collections.Counter()
         self.series = collections.deque(maxlen=SERIES_LEN)
         self._last = (0, 0, 0, 0)
@@ -740,7 +745,8 @@ class Manager:
         self.inbound = collections.deque(maxlen=1000)
         self.inbound_seq = 0
         self.trace_buf = collections.deque(maxlen=3000)
-        self.msgids = {}               # message_id -> (job, dest, submit_ts)
+        self.msgids = {}               # canonical message_id -> (job, dest, submit_ts, message_id)
+        self.mo_parts = {}             # (conn, src, dst, ref) -> partial concatenated MO
         self.msgid_cap = 3_000_000
         self.unmatched_dlr = 0
         self.dirty = False
@@ -810,6 +816,8 @@ class Manager:
     def log(self, level, msg):
         self.log_seq += 1
         self.logs.append({"id": self.log_seq, "t": now_ms(), "level": level, "msg": msg})
+        if LOG_STDOUT:
+            print("%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), level, msg), file=sys.stdout, flush=True)
 
     # ---------------------------------------------------------- connections
     def upsert_connection(self, data):
@@ -830,6 +838,7 @@ class Manager:
             if "password" in data and data["password"] == "" and conn.profile.get("password"):
                 clean.pop("password")   # empty password field = keep stored password
             conn.profile.update(clean)
+            conn.limiter.tps = float(conn.profile.get("max_tps", 0) or 0)
         else:
             cid = uuid.uuid4().hex[:8]
             conn = Connection(self, cid, clean)
@@ -857,6 +866,7 @@ class Manager:
         if cache is not None:
             return cache
         tlvs = []
+        # legacy REST shortcut for the India DLT tags; the GUI sends these as custom_tlvs
         nul = b"\x00" if spec.get("dlt_null_terminate") else b""
         for key, tag in (("dlt_entity_id", 0x1400), ("dlt_template_id", 0x1401), ("dlt_tm_id", 0x1402)):
             v = (spec.get(key) or "").strip()
@@ -864,6 +874,8 @@ class Manager:
                 tlvs.append((tag, v.encode() + nul))
         for t in spec.get("custom_tlvs") or []:
             tag = int(str(t.get("tag", "0")), 0)
+            if not 0 < tag <= 0xFFFF:
+                raise ValueError("TLV tag %s out of range" % t.get("tag"))
             fmt = t.get("format", "string")
             val = t.get("value", "")
             if fmt == "hex":
@@ -878,6 +890,8 @@ class Manager:
                 raw = val.encode() + b"\x00"
             else:
                 raw = val.encode()
+            if len(raw) > 0xFFFF:
+                raise ValueError("TLV 0x%04X value too long" % tag)
             tlvs.append((tag, raw))
         spec["_tlv_cache"] = tlvs
         return tlvs
@@ -897,7 +911,6 @@ class Manager:
             nums, invalid = parse_number_list(spec.get("numbers", ""))
             if not nums:
                 raise ValueError("no valid destination numbers")
-        self.static_tlvs(spec)   # validate TLVs early
         if conn.bound_count() == 0:
             self.log("warn", "job created while connection %s has no bound sessions; it will wait"
                      % conn.profile["name"])
@@ -919,38 +932,47 @@ class Manager:
         if len(self.msgids) >= self.msgid_cap:
             for _ in range(10000):
                 self.msgids.pop(next(iter(self.msgids)))
-        self.msgids[msg_id] = (job, dest, time.time())
+        self.msgids[_canon_msgid(msg_id)] = (job, dest, time.time(), msg_id)
 
     def _lookup(self, msg_id):
-        if msg_id in self.msgids:
-            return msg_id, self.msgids.pop(msg_id)
+        key = _canon_msgid(msg_id)
+        hit = self.msgids.pop(key, None)
+        if hit:
+            return hit
         # some SMSCs report hex ids in the response and decimal in the DLR (or vice versa)
-        cands = [msg_id.lower(), msg_id.upper(), msg_id.lstrip("0")]
+        alts = []
         try:
-            cands.append(format(int(msg_id), "x"))
-            cands.append(format(int(msg_id), "X"))
+            alts.append(_canon_msgid(format(int(key), "x")))
         except ValueError:
             pass
         try:
-            cands.append(str(int(msg_id, 16)))
+            alts.append(_canon_msgid(str(int(key, 16))))
         except ValueError:
             pass
-        for c in cands:
-            if c in self.msgids:
-                return c, self.msgids.pop(c)
-        return msg_id, None
+        for k in alts:
+            hit = self.msgids.pop(k, None)
+            if hit:
+                return hit
+        return None
 
     def on_deliver(self, conn, session, d):
         if "decode_error" in d:
             self.log("warn", "could not decode deliver_sm: %s" % d["decode_error"])
             return
         tlvs = d.get("tlvs", {})
-        text = decode_text(d.get("short_message", b""), d.get("data_coding", 0))
         esm = d.get("esm_class", 0)
-        is_dlr = (esm & 0x3C) in (0x04, 0x20) or P.TLV_RECEIPTED_MESSAGE_ID in tlvs
+        sm = d.get("short_message", b"")
+        concat = None
+        if esm & 0x40:
+            concat, sm = split_udh(sm)
+        elif tlvs.get(P.TLV_SAR_MSG_REF_NUM) and tlvs.get(P.TLV_SAR_TOTAL_SEGMENTS) and \
+                tlvs.get(P.TLV_SAR_SEGMENT_SEQNUM):
+            concat = (int.from_bytes(tlvs[P.TLV_SAR_MSG_REF_NUM], "big"), tlvs[P.TLV_SAR_TOTAL_SEGMENTS][0],
+                      tlvs[P.TLV_SAR_SEGMENT_SEQNUM][0])
+        text = decode_text(sm, d.get("data_coding", 0))
+        is_dlr = (esm & 0x3C) in DLR_ESM_TYPES or P.TLV_RECEIPTED_MESSAGE_ID in tlvs
         m = DLR_RE.search(text) if (is_dlr or "stat:" in text) else None
-        self.inbound_seq += 1
-        rec = {"id": self.inbound_seq, "t": now_ms(), "conn": conn.profile["name"], "bind": session.index,
+        rec = {"t": now_ms(), "conn": conn.profile["name"], "bind": session.index,
                "src": d.get("source_addr"), "dst": d.get("destination_addr"), "esm": esm,
                "dc": d.get("data_coding", 0), "text": text}
         if is_dlr or m:
@@ -966,11 +988,14 @@ class Manager:
                 msg_id = msg_id or m.group("id")
                 stat = m.group("stat").upper() or stat
                 err = m.group("err") or ""
+            nec = tlvs.get(P.TLV_NETWORK_ERROR_CODE)
+            if not err and nec and len(nec) == 3:
+                err = str(int.from_bytes(nec[1:3], "big"))
             rec.update(kind="DLR", msg_id=msg_id, stat=stat, err=err)
             if msg_id:
-                key, hit = self._lookup(msg_id)
+                hit = self._lookup(msg_id)
                 if hit:
-                    job, dest, ts = hit
+                    job, dest, ts, key = hit
                     rec["job"] = job.id
                     job.on_dlr(key, dest, stat, err, ts, session, text)
                 else:
@@ -979,7 +1004,31 @@ class Manager:
             conn.c["mo"] += 1
             session.stats["mo"] += 1
             rec["kind"] = "MO"
+            if concat and concat[1] > 1:
+                key = (conn.id, rec["src"], rec["dst"], concat[0])
+                buf = self.mo_parts.setdefault(key, {"t": time.time(), "total": concat[1], "parts": {}, "rec": rec})
+                buf["parts"][concat[2]] = text
+                if len(buf["parts"]) < buf["total"]:
+                    return
+                del self.mo_parts[key]
+                rec["text"] = "".join(buf["parts"][i] for i in sorted(buf["parts"]))
+                rec["parts"] = "%d" % buf["total"]
+        self._add_inbound(rec)
+
+    def _add_inbound(self, rec):
+        self.inbound_seq += 1
+        rec["id"] = self.inbound_seq
         self.inbound.append(rec)
+
+    def _expire_mo_parts(self):
+        cutoff = time.time() - MO_PART_TTL
+        for key in [k for k, b in self.mo_parts.items() if b["t"] < cutoff]:
+            buf = self.mo_parts.pop(key)
+            rec = buf["rec"]
+            rec["text"] = "".join(buf["parts"][i] for i in sorted(buf["parts"]))
+            rec["parts"] = "%d/%d incomplete" % (len(buf["parts"]), buf["total"])
+            self._add_inbound(rec)
+            self.log("warn", "concatenated MO from %s: only %s parts arrived" % (rec["src"], rec["parts"]))
 
     # ---------------------------------------------------------- periodic
     async def ticker(self):
@@ -1005,6 +1054,7 @@ class Manager:
                     if self.msgids[k][2] >= cutoff:
                         break
                     self.msgids.pop(k)
+                self._expire_mo_parts()
 
     def snapshot(self):
         return {"t": now_ms(),

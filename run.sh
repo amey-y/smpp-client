@@ -9,8 +9,4 @@ if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv
   .venv/bin/pip install -q -r requirements.txt
 fi
-if [ "${1:-}" = "mock" ]; then
-  shift
-  exec .venv/bin/python -m smppclient.mock_smsc "$@"
-fi
-exec .venv/bin/python -m smppclient.server "$@"
+exec .venv/bin/python -m smppclient "$@"

@@ -1,0 +1,29 @@
+services:
+  smpp-client:
+    build: .
+    image: ${IMAGE:-smpp-client:latest}
+    restart: unless-stopped
+    ports:
+      - "8095:8095"     # web GUI
+      - "2775:2775"     # built-in mock SMSC (optional, only if started from the GUI)
+    environment:
+      SMPPCLIENT_USER: ${SMPPCLIENT_USER:-}
+      SMPPCLIENT_PASSWORD: ${SMPPCLIENT_PASSWORD:-}
+    volumes:
+      - smpp-data:/data
+    ulimits:
+      nofile: 65536
+
+  # standalone mock SMSC, e.g. for CI:  docker compose --profile mock up
+  mock-smsc:
+    build: .
+    image: ${IMAGE:-smpp-client:latest}
+    profiles: ["mock"]
+    command: ["mock", "--port", "2775", "--max-binds", "10"]
+    ports:
+      - "2776:2775"
+    healthcheck:
+      disable: true
+
+volumes:
+  smpp-data:
